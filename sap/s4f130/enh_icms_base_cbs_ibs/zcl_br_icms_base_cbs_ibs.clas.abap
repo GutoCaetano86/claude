@@ -6,24 +6,28 @@
 "!
 "! Configuração 100% na STVARV (nada fixo no código), separada por módulo:
 "!   ZBR_ICMS_BC_CBS_IBS_ATIVO     (Parâmetro) = 'X' liga a regra (geral)
-"!   ZBR_ICMS_BC_CBS_IBS_MODO_SD   (Parâmetro) = 'B' bruto / 'L' líquido
-"!   ZBR_ICMS_BC_CBS_IBS_MODO_MM   (Parâmetro) = 'B' bruto / 'L' líquido
+"!   ZBR_ICMS_BC_CBS_IBS_MODO_MM   (Parâmetro) = 'L' líquido / 'B' ou vazio bruto
 "!   ZBR_ICMS_BC_CBS_IBS_KSCHL_SD  (Seleção)   = condições SD de CBS/IBS
 "!   ZBR_ICMS_BC_CBS_IBS_KSCHL_MM  (Seleção)   = condições MM de CBS/IBS
 "!     Ex. S4F/130: SD (RVABRA/ZBRA01) CBS3/IB3S/IB3M;
 "!                  MM (TAXBRA) BXCB/BXBS/BXBM - CBS1/IB1S/IB1M têm KBETR 100%
 "!                  fixo, o valor do imposto fica nas BX* (passos 180-182).
-"!   Módulo sem modo válido ou sem lista de condições = regra desligada nele.
+"!   Módulo sem lista de condições = regra desligada nele.
+"!   SD não tem modo na STVARV: segue o esquema de preço do documento.
 "!
 "! Cálculo (N = líquido, C = CBS+IBS, t = alíquota ICMS, b = fator de base):
 "!   BC ICMS = base standard + C ; ICMS = t x BC ICMS
-"!   L - líquido mantido: o ICMS sobre C entra no preço (V = N + ICMS)
-"!   B - preço com ICMS mantido: o ICMS sobre C sai do líquido
+"!   Líquido: o líquido é mantido e o ICMS sobre C entra no preço (V = N + ICMS)
+"!   Bruto:   o preço com ICMS é mantido e o ICMS sobre C sai do líquido
 "! Passos da CL_TAX_CALC_BR (J_1BTXCOND):
 "!   CALCULATE_TAX       SD: ICMI, forma o preço (NETWR + ICMS), com gross-up
 "!                       MM: BX01, passo único, com gross-up
 "!   CALCULATE_INCL_2ND  SD: IBRX, base já inclui ICMS (sem gross-up)
-"! No CALCULATE_TAX em modo L o líquido recebe t x b x C antes do gross-up:
+"! SD: o esquema define o modo. Esquema de preço líquido (ICMI pela fórmula
+"! 320) passa pelo CALCULATE_TAX e é tratado como líquido; esquema de preço
+"! bruto (ICMI informado / outra fórmula) só passa pelo IBRX: bruto.
+"! MM: modo da STVARV ZBR_ICMS_BC_CBS_IBS_MODO_MM (padrão bruto).
+"! No CALCULATE_TAX em modo líquido o líquido recebe t x b x C antes do gross-up:
 "! o valor com ICMS sai = N + ICMS final, sem C, e é a base de IPI e PIS/COFINS.
 "! No fim do cálculo o ICMS recebe t x b x C e as bases do ICMS recebem C.
 "!
@@ -48,7 +52,7 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
       c_modo_bruto  TYPE char1 VALUE 'B',
       c_modo_liquid TYPE char1 VALUE 'L'.
 
-    "! Regra ativa para o módulo? (switch geral, modo e lista preenchidos)
+    "! Regra ativa para o módulo? (switch geral e lista de condições)
     "! @parameter iv_kappl  | Aplicação do cálculo: V = SD, TX = MM
     CLASS-METHODS is_active
       IMPORTING iv_kappl         TYPE kappl
@@ -101,7 +105,6 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
   PRIVATE SECTION.
     CONSTANTS:
       c_tvarv_ativo    TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_ATIVO',
-      c_tvarv_modo_sd  TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_MODO_SD',
       c_tvarv_modo_mm  TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_MODO_MM',
       c_tvarv_kschl_sd TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_KSCHL_SD',
       c_tvarv_kschl_mm TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_KSCHL_MM',
@@ -146,7 +149,7 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
 
     CLASS-METHODS load_module
       IMPORTING iv_kappl      TYPE kappl
-                iv_tvarv_modo TYPE rvari_vnam
+                iv_tvarv_modo TYPE rvari_vnam OPTIONAL
                 iv_tvarv_list TYPE rvari_vnam.
 
     CLASS-METHODS get_cfg
@@ -241,16 +244,13 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
       " IBRX: preço com ICMS já formado; CBS/IBS só na base do ICMS
       lv_icms_add = lv_cbs_ibs.
 
-    ELSEIF get_cfg( iv_kappl )-modo = c_modo_liquid.
-      " Líquido: o ICMS sobre o CBS/IBS entra no preço. Somar t x C ao
-      " líquido faz o gross-up sair N + ICMS final, sem o CBS/IBS
+    ELSEIF iv_kappl = c_kappl_sd
+        OR get_cfg( iv_kappl )-modo = c_modo_liquid.
+      " Líquido (SD: esquema de preço líquido, ICMI pela fórmula 320): o
+      " ICMS sobre o CBS/IBS entra no preço. Somar t x C ao líquido faz o
+      " gross-up sair N + ICMS final, sem o CBS/IBS
       lv_add_net  = lv_cbs_ibs * iv_icms_rate.
       lv_icms_add = lv_cbs_ibs.
-
-    ELSEIF iv_kappl = c_kappl_sd.
-      " Bruto SD: passo de preço (ICMI) fica como no standard; o CBS/IBS
-      " entra só no IBRX
-      lv_icms_add = 0.
 
     ELSE.
       " Bruto MM: preço com ICMS mantido; CBS/IBS só na base do ICMS
@@ -328,8 +328,8 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
       INTO @DATA(lv_ativo).
     gv_ativo = xsdbool( lv_ativo = abap_true ).
 
+    " SD sem modo: o esquema de preço define bruto ou líquido
     load_module( iv_kappl      = c_kappl_sd
-                 iv_tvarv_modo = c_tvarv_modo_sd
                  iv_tvarv_list = c_tvarv_kschl_sd ).
 
     load_module( iv_kappl      = c_kappl_mm
@@ -343,15 +343,17 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
 
     ls_cfg-kappl = iv_kappl.
 
-    SELECT SINGLE low FROM tvarvc
-      WHERE name = @iv_tvarv_modo
-        AND type = 'P'
-        AND numb = '0000'
-      INTO @ls_cfg-modo.
+    IF iv_tvarv_modo IS NOT INITIAL.
+      SELECT SINGLE low FROM tvarvc
+        WHERE name = @iv_tvarv_modo
+          AND type = 'P'
+          AND numb = '0000'
+        INTO @ls_cfg-modo.
+    ENDIF.
 
-    " Sem modo válido o módulo fica desligado
-    IF ls_cfg-modo <> c_modo_bruto AND ls_cfg-modo <> c_modo_liquid.
-      RETURN.
+    " Modo diferente de líquido (inclusive vazio) = bruto
+    IF ls_cfg-modo <> c_modo_liquid.
+      ls_cfg-modo = c_modo_bruto.
     ENDIF.
 
     SELECT sign, opti AS option, low, high FROM tvarvc
