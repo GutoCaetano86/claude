@@ -31,10 +31,14 @@
 "! o valor com ICMS sai = N + ICMS final, sem C, e é a base de IPI e PIS/COFINS.
 "! No fim do cálculo o ICMS recebe t x b x C e as bases do ICMS recebem C.
 "!
-"! Valor de CBS/IBS: KWERT da condição. Quando a condição ainda não tem valor
-"! (ex. faturamento com tipo de preço G: impostos redeterminados e CBS/IBS
-"! depois do ICMI no esquema, num cálculo único), usa alíquota x base, com a
-"! base = líquido do item (NET_AMOUNT do passo CALCULATE_TAX).
+"! Valor de CBS/IBS no SD: sempre alíquota (KBETR) x base, nunca o KWERT do
+"! documento. O CBS/IBS fica depois do ICMS no esquema (a base dele exclui o
+"! ICMS), então o KWERT visto no cálculo do ICMS é de um cálculo anterior.
+"!   Líquido: base = líquido do item (NET_AMOUNT do passo CALCULATE_TAX)
+"!   Bruto:   resolvido no fim do cálculo, com ICMS e PIS/COFINS do standard:
+"!            base = (P - ICMS - PIS - COFINS) / (1 + R x t x b)
+"!            P = valor com ICMS (sem IPI), R = soma das alíquotas CBS/IBS
+"! MM: KWERT das condições (BX*); sem valor, alíquota x base.
 "!
 "! Fora do escopo (seguem o standard, sem CBS/IBS): FCP, ICMS-ST, partilha
 "! (DIFAL), Convênio 100, CT-e.
@@ -91,15 +95,29 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
                 it_komv              TYPE tax_xkomv_tab
       RETURNING VALUE(rv_net_amount) TYPE kawrt.
 
-    "! Fim do cálculo: CBS/IBS a somar na base do ICMS deste passo (0 = nada)
-    "! @parameter io_calc    | Instância da CL_TAX_CALC_BR (ME)
-    "! @parameter iv_kposn   | Item (MS_KOMP-KPOSN)
-    "! @parameter iv_kschl   | Condição que chamou o cálculo (MS_KOMV_FRM-KSCHL)
-    "! @parameter rv_amount  | CBS + IBS a somar na base do ICMS
+    "! Fim do cálculo: CBS/IBS a somar na base do ICMS deste passo (0 = nada).
+    "! No bruto do SD o CBS/IBS é calculado aqui, com os valores finais do
+    "! standard (ICMS sem o CBS/IBS, PIS e COFINS).
+    "! @parameter io_calc       | Instância da CL_TAX_CALC_BR (ME)
+    "! @parameter iv_kappl      | Aplicação do cálculo (MS_KOMK-KAPPL)
+    "! @parameter iv_kposn      | Item (MS_KOMP-KPOSN)
+    "! @parameter iv_kschl      | Condição que chamou o cálculo (MS_KOMV_FRM-KSCHL)
+    "! @parameter it_komv       | KOMV do item
+    "! @parameter iv_value      | Valor com ICMS, sem IPI (LV_VAL_INCL_ICMS)
+    "! @parameter iv_icms_amt   | ICMS do standard, sem o CBS/IBS
+    "! @parameter iv_pis_cofins | PIS + COFINS do standard
+    "! @parameter iv_icms_rate  | Alíquota ICMS x fator de base (fração)
+    "! @parameter rv_amount     | CBS + IBS a somar na base do ICMS
     CLASS-METHODS get_icms_base_increment
       IMPORTING io_calc          TYPE REF TO object
+                iv_kappl         TYPE kappl
                 iv_kposn         TYPE kposn
                 iv_kschl         TYPE kscha
+                it_komv          TYPE tax_xkomv_tab
+                iv_value         TYPE ty_amount
+                iv_icms_amt      TYPE ty_amount
+                iv_pis_cofins    TYPE ty_amount
+                iv_icms_rate     TYPE ty_amount
       RETURNING VALUE(rv_amount) TYPE ty_amount.
 
   PRIVATE SECTION.
@@ -121,15 +139,21 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
              r_kschl TYPE ty_r_kschl,
            END OF ty_cfg.
 
-    " Por instância / item / passo: último NET_AMOUNT devolvido e o CBS/IBS
-    " que o fim do cálculo soma na base do ICMS (0 = não soma)
+    " Por instância / item / passo: último NET_AMOUNT devolvido, se ele foi
+    " alterado, e o CBS/IBS que o fim do cálculo soma na base do ICMS
+    " (gross = X: bruto do SD, calculado no fim)
     TYPES: BEGIN OF ty_memo,
              calc     TYPE REF TO object,
              kposn    TYPE kposn,
              kschl    TYPE kscha,
              net      TYPE kawrt,
+             changed  TYPE abap_bool,
              icms_add TYPE ty_amount,
+             gross    TYPE abap_bool,
            END OF ty_memo.
+
+    " Alíquota (fração) de cada condição de CBS/IBS do item
+    TYPES ty_t_rate TYPE STANDARD TABLE OF ty_amount WITH EMPTY KEY.
 
     " Base de CBS/IBS (líquido) guardada no passo CALCULATE_TAX do item
     TYPES: BEGIN OF ty_base,
@@ -156,13 +180,19 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
       IMPORTING iv_kappl      TYPE kappl
       RETURNING VALUE(rs_cfg) TYPE ty_cfg.
 
-    CLASS-METHODS get_cbs_ibs_base
-      IMPORTING io_calc        TYPE REF TO object
-                iv_kposn       TYPE kposn
-                iv_cond_code   TYPE j_1btxcode
-                iv_icms_rate   TYPE ty_amount
-                iv_net_amount  TYPE kawrt
-      RETURNING VALUE(rv_base) TYPE ty_amount.
+    CLASS-METHODS get_rates
+      IMPORTING iv_kappl        TYPE kappl
+                it_komv         TYPE tax_xkomv_tab
+      RETURNING VALUE(rt_rate)  TYPE ty_t_rate.
+
+    CLASS-METHODS get_gross_cbs_ibs
+      IMPORTING iv_kappl         TYPE kappl
+                it_komv          TYPE tax_xkomv_tab
+                iv_value         TYPE ty_amount
+                iv_icms_amt      TYPE ty_amount
+                iv_pis_cofins    TYPE ty_amount
+                iv_icms_rate     TYPE ty_amount
+      RETURNING VALUE(rv_amount) TYPE ty_amount.
 ENDCLASS.
 
 
@@ -187,6 +217,15 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " SD: sempre alíquota x base (o KWERT é de um cálculo anterior)
+    IF iv_kappl = c_kappl_sd.
+      LOOP AT get_rates( iv_kappl = iv_kappl it_komv = it_komv ) INTO lv_rate.
+        rv_amount = rv_amount + round( val = iv_base * lv_rate dec = 2 ).
+      ENDLOOP.
+      RETURN.
+    ENDIF.
+
+    " MM: valor das condições; sem valor, alíquota x base
     LOOP AT it_komv ASSIGNING FIELD-SYMBOL(<ls_komv>)
          WHERE kschl IN ls_cfg-r_kschl
            AND kinak IS INITIAL.          "Ignora condição inativa
@@ -196,79 +235,89 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
         CONTINUE.
       ENDIF.
 
-      " Condição ainda sem valor neste cálculo: alíquota x base
-      CASE <ls_komv>-krech.
-        WHEN c_krech_perc.
-          lv_rate = <ls_komv>-kbetr / 1000.
-        WHEN c_krech_perc6.
-          lv_rate = <ls_komv>-kbetr / 1000000.
-        WHEN OTHERS.
-          lv_rate = 0.
-      ENDCASE.
-
-      rv_amount = rv_amount + abs( round( val = iv_base * lv_rate dec = 2 ) ).
+      LOOP AT get_rates( iv_kappl = iv_kappl
+                         it_komv  = VALUE #( ( <ls_komv> ) ) ) INTO lv_rate.
+        rv_amount = rv_amount + round( val = iv_base * lv_rate dec = 2 ).
+      ENDLOOP.
     ENDLOOP.
   ENDMETHOD.
 
 
   METHOD adjust_net_amount.
     DATA:
+      lv_base     TYPE ty_amount,
+      lv_cbs_ibs  TYPE ty_amount,
       lv_add_net  TYPE ty_amount,
-      lv_icms_add TYPE ty_amount.
+      lv_gross    TYPE abap_bool.
 
     rv_net_amount = iv_net_amount.
 
     " CALCULATE_TAXES pode rodar 2x no mesmo passo sem o standard refazer o
     " NET_AMOUNT (ADJUST_ICMS_DUE_MINPRICE, nota 2141500): se o valor recebido
-    " é o que este método devolveu da última vez, o ajuste já está dentro e
-    " o registro para o fim do cálculo continua valendo.
+    " é o que este método devolveu alterado da última vez, o ajuste já está
+    " dentro e o registro para o fim do cálculo continua valendo.
     READ TABLE gt_memo ASSIGNING FIELD-SYMBOL(<ls_memo>)
          WITH KEY calc  = io_calc
                   kposn = iv_kposn
                   kschl = iv_kschl.
-    IF sy-subrc = 0 AND <ls_memo>-net = iv_net_amount.
+    IF sy-subrc = 0 AND <ls_memo>-changed = abap_true
+                    AND <ls_memo>-net = iv_net_amount.
       RETURN.
     ENDIF.
 
-    DATA(lv_base) = get_cbs_ibs_base( io_calc       = io_calc
-                                      iv_kposn      = iv_kposn
-                                      iv_cond_code  = iv_cond_code
-                                      iv_icms_rate  = iv_icms_rate
-                                      iv_net_amount = iv_net_amount ).
+    " Base de CBS/IBS = líquido do item. No CALCULATE_TAX o NET_AMOUNT é o
+    " líquido: guarda para o IBRX do mesmo item, cujo NET_AMOUNT já tem ICMS
+    READ TABLE gt_base ASSIGNING FIELD-SYMBOL(<ls_base>)
+         WITH KEY calc  = io_calc
+                  kposn = iv_kposn.
 
-    DATA(lv_cbs_ibs) = get_cbs_ibs_amount( iv_kappl = iv_kappl
-                                           it_komv  = it_komv
-                                           iv_base  = lv_base ).
-
-    IF iv_cond_code = c_code_incl_2nd.
-      " IBRX: preço com ICMS já formado; CBS/IBS só na base do ICMS
-      lv_icms_add = lv_cbs_ibs.
-
-    ELSEIF iv_kappl = c_kappl_sd
-        OR get_cfg( iv_kappl )-modo = c_modo_liquid.
-      " Líquido (SD: esquema de preço líquido, ICMI pela fórmula 320): o
-      " ICMS sobre o CBS/IBS entra no preço. Somar t x C ao líquido faz o
-      " gross-up sair N + ICMS final, sem o CBS/IBS
-      lv_add_net  = lv_cbs_ibs * iv_icms_rate.
-      lv_icms_add = lv_cbs_ibs.
-
+    IF iv_cond_code <> c_code_incl_2nd.
+      lv_base = iv_net_amount.
+      IF <ls_base> IS ASSIGNED.
+        <ls_base>-base = lv_base.
+      ELSE.
+        APPEND VALUE #( calc  = io_calc
+                        kposn = iv_kposn
+                        base  = lv_base ) TO gt_base.
+      ENDIF.
+    ELSEIF <ls_base> IS ASSIGNED.
+      " IBRX de esquema líquido: base do passo de preço deste item
+      lv_base = <ls_base>-base.
+      DELETE gt_base WHERE calc = io_calc AND kposn = iv_kposn.
+    ELSEIF iv_kappl = c_kappl_sd.
+      " IBRX sem passo de preço (SD bruto): a base depende do ICMS, PIS e
+      " COFINS finais; o CBS/IBS é calculado no fim do cálculo
+      lv_gross = abap_true.
     ELSE.
-      " Bruto MM: preço com ICMS mantido; CBS/IBS só na base do ICMS
-      lv_icms_add = lv_cbs_ibs.
+      lv_base = iv_net_amount * ( 1 - iv_icms_rate ).
+    ENDIF.
+
+    IF lv_gross = abap_false.
+      lv_cbs_ibs = get_cbs_ibs_amount( iv_kappl = iv_kappl
+                                       it_komv  = it_komv
+                                       iv_base  = lv_base ).
+    ENDIF.
+
+    " Líquido (SD: esquema de preço líquido, ICMI pela fórmula 320; MM:
+    " modo L): o ICMS sobre o CBS/IBS entra no preço. Somar t x C ao líquido
+    " faz o gross-up sair N + ICMS final, sem o CBS/IBS. Bruto e IBRX: o
+    " preço com ICMS é mantido, o CBS/IBS entra só na base do ICMS
+    IF iv_cond_code <> c_code_incl_2nd
+       AND ( iv_kappl = c_kappl_sd OR get_cfg( iv_kappl )-modo = c_modo_liquid ).
+      lv_add_net = lv_cbs_ibs * iv_icms_rate.
     ENDIF.
 
     rv_net_amount = iv_net_amount + lv_add_net.
 
-    IF <ls_memo> IS ASSIGNED.
-      <ls_memo>-net      = rv_net_amount.
-      <ls_memo>-icms_add = lv_icms_add.
-    ELSE.
-      APPEND VALUE #( calc     = io_calc
-                      kposn    = iv_kposn
-                      kschl    = iv_kschl
-                      net      = rv_net_amount
-                      icms_add = lv_icms_add ) TO gt_memo.
+    IF <ls_memo> IS NOT ASSIGNED.
+      APPEND VALUE #( calc  = io_calc
+                      kposn = iv_kposn
+                      kschl = iv_kschl ) TO gt_memo ASSIGNING <ls_memo>.
     ENDIF.
+    <ls_memo>-net      = rv_net_amount.
+    <ls_memo>-changed  = xsdbool( lv_add_net IS NOT INITIAL ).
+    <ls_memo>-icms_add = lv_cbs_ibs.
+    <ls_memo>-gross    = lv_gross.
   ENDMETHOD.
 
 
@@ -277,40 +326,73 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
          WITH KEY calc  = io_calc
                   kposn = iv_kposn
                   kschl = iv_kschl.
-    IF sy-subrc = 0.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    IF <ls_memo>-gross = abap_true.
+      rv_amount = get_gross_cbs_ibs( iv_kappl      = iv_kappl
+                                     it_komv       = it_komv
+                                     iv_value      = iv_value
+                                     iv_icms_amt   = iv_icms_amt
+                                     iv_pis_cofins = iv_pis_cofins
+                                     iv_icms_rate  = iv_icms_rate ).
+    ELSE.
       rv_amount = <ls_memo>-icms_add.
     ENDIF.
   ENDMETHOD.
 
 
-  METHOD get_cbs_ibs_base.
-    " Base de CBS/IBS = líquido do item, usada só se a condição ainda não
-    " tem valor. No CALCULATE_TAX o NET_AMOUNT é o líquido: guarda para o
-    " IBRX do mesmo item, cujo NET_AMOUNT já inclui o ICMS.
-    READ TABLE gt_base ASSIGNING FIELD-SYMBOL(<ls_base>)
-         WITH KEY calc  = io_calc
-                  kposn = iv_kposn.
+  METHOD get_gross_cbs_ibs.
+    DATA:
+      lv_rate_sum TYPE ty_amount,
+      lv_base     TYPE ty_amount.
 
-    IF iv_cond_code <> c_code_incl_2nd.
-      rv_base = iv_net_amount.
-      IF <ls_base> IS ASSIGNED.
-        <ls_base>-base = rv_base.
-      ELSE.
-        APPEND VALUE #( calc  = io_calc
-                        kposn = iv_kposn
-                        base  = rv_base ) TO gt_base.
-      ENDIF.
+    " Base do CBS/IBS = P - ICMS final - PIS - COFINS, com ICMS final =
+    " ICMS standard + t x C e C = R x base. Isolando a base:
+    "   base = (P - ICMS standard - PIS - COFINS) / (1 + R x t)
+    LOOP AT get_rates( iv_kappl = iv_kappl it_komv = it_komv ) INTO DATA(lv_rate).
+      lv_rate_sum = lv_rate_sum + lv_rate.
+    ENDLOOP.
+
+    IF lv_rate_sum IS INITIAL.
       RETURN.
     ENDIF.
 
-    IF <ls_base> IS ASSIGNED.
-      " Consome a base do passo de preço deste item
-      rv_base = <ls_base>-base.
-      DELETE gt_base WHERE calc = io_calc AND kposn = iv_kposn.
-    ELSE.
-      " Sem passo de preço (preço bruto): líquido = preço com ICMS x (1 - t)
-      rv_base = iv_net_amount * ( 1 - iv_icms_rate ).
+    lv_base = ( iv_value - iv_icms_amt - iv_pis_cofins )
+            / ( 1 + lv_rate_sum * iv_icms_rate ).
+    IF lv_base <= 0.
+      RETURN.
     ENDIF.
+
+    rv_amount = get_cbs_ibs_amount( iv_kappl = iv_kappl
+                                    it_komv  = it_komv
+                                    iv_base  = lv_base ).
+  ENDMETHOD.
+
+
+  METHOD get_rates.
+    DATA lv_rate TYPE ty_amount.
+
+    load_config( ).
+    DATA(ls_cfg) = get_cfg( iv_kappl ).
+    IF ls_cfg-r_kschl IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    LOOP AT it_komv ASSIGNING FIELD-SYMBOL(<ls_komv>)
+         WHERE kschl IN ls_cfg-r_kschl
+           AND kinak IS INITIAL.          "Ignora condição inativa
+      CASE <ls_komv>-krech.
+        WHEN c_krech_perc.
+          lv_rate = abs( <ls_komv>-kbetr ) / 1000.
+        WHEN c_krech_perc6.
+          lv_rate = abs( <ls_komv>-kbetr ) / 1000000.
+        WHEN OTHERS.
+          CONTINUE.
+      ENDCASE.
+      APPEND lv_rate TO rt_rate.
+    ENDLOOP.
   ENDMETHOD.
 
 

@@ -8,10 +8,17 @@ ENHANCEMENT 1  .
   DATA: lv_zcbs_bas_red TYPE zcl_br_icms_base_cbs_ibs=>ty_amount,
         lv_zcbs_pc_diff TYPE zcl_br_icms_base_cbs_ibs=>ty_amount.
 
+  " No bruto do SD o CBS/IBS é calculado aqui, com ICMS, PIS e COFINS finais
   DATA(lv_zcbs_add) = zcl_br_icms_base_cbs_ibs=>get_icms_base_increment(
-                        io_calc  = me
-                        iv_kposn = ms_komp-kposn
-                        iv_kschl = ms_komv_frm-kschl ).
+                        io_calc       = me
+                        iv_kappl      = ms_komk-kappl
+                        iv_kposn      = ms_komp-kposn
+                        iv_kschl      = ms_komv_frm-kschl
+                        it_komv       = mt_komv
+                        iv_value      = lv_val_incl_icms
+                        iv_icms_amt   = ms_tax_result-icms_amt
+                        iv_pis_cofins = ms_tax_result-pis_amt + ms_tax_result-cofins_amt
+                        iv_icms_rate  = ms_tax_data-icmsrate * ms_tax_data-icmsbase ).
 
   IF lv_zcbs_add IS NOT INITIAL
      AND zcl_br_icms_base_cbs_ibs=>is_active( ms_komk-kappl ) = abap_true
