@@ -1,11 +1,15 @@
 "! <p class="shorttext synchronized" lang="pt">Reforma Tributária: CBS/IBS na base do ICMS (SD/MM)</p>
 "! Chamada pela enhancement ZENH_BR_ICMS_BC_CBS_IBS no início de
-"! CL_TAX_CALC_BR->CALCULATE_TAXES. Calcula o valor de CBS + IBS do item
-"! a partir das alíquotas já determinadas na KOMV (TAXBRA / RVABRA).
+"! CL_TAX_CALC_BR->CALCULATE_TAXES. Soma o valor de CBS + IBS do item a partir
+"! do KWERT das condições que carregam o valor do imposto em cada esquema:
+"!   MM (TAXBRA): BXCB / BXBS / BXBM - CBS1, IB1S e IB1M têm KBETR = 100% fixo;
+"!                a alíquota real fica nas BX*, cujo KWERT já é o valor do
+"!                imposto (passos 180-182, calculados antes do ICMS).
+"!   SD (RVABRA/ZBRA01): CBS3 / IB3S / IB3M - KRECH 'W', valor em KWERT.
 "!
 "! Liga/desliga e lista de condições ficam na STVARV (sem transporte de código):
 "!   ZBR_ICMS_BC_CBS_IBS_ATIVO  (P) = 'X' ativa a regra
-"!   ZBR_ICMS_BC_CBS_IBS_KSCHL  (S) = tipos de condição CBS/IBS (opcional;
+"!   ZBR_ICMS_BC_CBS_IBS_KSCHL  (S) = condições cujo KWERT é somado (opcional;
 "!                                    vazio usa a lista padrão abaixo)
 CLASS zcl_br_icms_base_cbs_ibs DEFINITION
   PUBLIC
@@ -21,18 +25,15 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
 
     "! Soma CBS + IBS (UF + Mun.) do item
     "! @parameter it_komv    | KOMV do item (MT_KOMV da CL_TAX_CALC_BR)
-    "! @parameter iv_base    | Base CBS/IBS = valor líquido do item (KAWRT)
     "! @parameter rv_amount  | Valor a somar na base do ICMS
     CLASS-METHODS get_cbs_ibs_amount
       IMPORTING it_komv          TYPE tax_xkomv_tab
-                iv_base          TYPE kawrt
       RETURNING VALUE(rv_amount) TYPE ty_amount.
 
   PRIVATE SECTION.
     CONSTANTS:
       c_tvarv_ativo TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_ATIVO',
-      c_tvarv_kschl TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_KSCHL',
-      c_krech_perc  TYPE krech      VALUE 'A'.   "Cálculo percentual
+      c_tvarv_kschl TYPE rvari_vnam VALUE 'ZBR_ICMS_BC_CBS_IBS_KSCHL'.
 
     TYPES ty_r_kschl TYPE RANGE OF kscha.
 
@@ -55,27 +56,13 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
 
 
   METHOD get_cbs_ibs_amount.
-    DATA lv_value TYPE ty_amount.
-
+    " Garante a lista carregada: range vazio no WHERE somaria a KOMV inteira
     load_config( ).
 
     LOOP AT it_komv ASSIGNING FIELD-SYMBOL(<ls_komv>)
          WHERE kschl IN gr_kschl
            AND kinak IS INITIAL.          "Ignora condição inativa
-
-      CLEAR lv_value.
-
-      IF <ls_komv>-krech = c_krech_perc.
-        " Alíquota já vem da tabela de condições (KBETR em ‰: 9 = 0,9%).
-        " O valor (KWERT) ainda não existe nesta passada, porque CBS/IBS
-        " ficam DEPOIS do cálculo do ICMS no esquema.
-        lv_value = iv_base * <ls_komv>-kbetr / 1000.
-      ELSE.
-        " Outros tipos de cálculo: usa o valor já gravado na KOMV
-        lv_value = <ls_komv>-kwert.
-      ENDIF.
-
-      rv_amount = rv_amount + abs( lv_value ).
+      rv_amount = rv_amount + abs( <ls_komv>-kwert ).
     ENDLOOP.
   ENDMETHOD.
 
@@ -94,7 +81,7 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
       INTO @DATA(lv_ativo).
     gv_active = xsdbool( lv_ativo = abap_true ).
 
-    " Tipos de condição CBS/IBS
+    " Condições cujo KWERT é o valor de CBS/IBS
     SELECT sign, opti AS option, low, high FROM tvarvc
       WHERE name = @c_tvarv_kschl
         AND type = 'S'
@@ -102,13 +89,15 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
       INTO CORRESPONDING FIELDS OF TABLE @gr_kschl.
 
     IF gr_kschl IS INITIAL.
-      " Padrão S4F/130: TAXBRA (MM) e RVABRA (SD)
+      " Padrão S4F/130. Cada esquema só tem um dos grupos, então não há
+      " soma em dobro: o TAXBRA não tem CBS3/IB3x e o SD não tem BX*.
       gr_kschl = VALUE #( sign = 'I' option = 'EQ'
-                          ( low = 'CBS1' ) ( low = 'CBS2' )      "CBS - MM
-                          ( low = 'IB1S' ) ( low = 'IB2S' )      "IBS UF - MM
-                          ( low = 'IB1M' ) ( low = 'IB2M' )      "IBS Mun - MM
-                          ( low = 'CBS3' )                       "CBS - SD
-                          ( low = 'IB3S' ) ( low = 'IB3M' ) ).   "IBS - SD
+                          ( low = 'BXCB' )                       "CBS     - MM
+                          ( low = 'BXBS' )                       "IBS UF  - MM
+                          ( low = 'BXBM' )                       "IBS Mun - MM
+                          ( low = 'CBS3' )                       "CBS     - SD
+                          ( low = 'IB3S' )                       "IBS UF  - SD
+                          ( low = 'IB3M' ) ).                    "IBS Mun - SD
     ENDIF.
   ENDMETHOD.
 
