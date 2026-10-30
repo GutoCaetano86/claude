@@ -1,8 +1,8 @@
 ENHANCEMENT 1  .
 *----------------------------------------------------------------------*
 * ZENH_BR_ICMS_BC_CBS_IBS - Reforma Tributária
-* Inclui CBS/IBS na base do ICMS (SD e MM, preço bruto ou líquido)
-* Ponto: início de CL_TAX_CALC_BR->CALCULATE_TAXES
+* Início de CL_TAX_CALC_BR->CALCULATE_TAXES: prepara o líquido do passo
+* para o CBS/IBS entrar só na base do ICMS (fim: ZENH_BR_ICMS_BC_CBS_IBS_FIM)
 * Configuração (STVARV) e regra: ZCL_BR_ICMS_BASE_CBS_IBS
 *----------------------------------------------------------------------*
   IF zcl_br_icms_base_cbs_ibs=>is_active( ms_komk-kappl ) = abap_true.
@@ -21,7 +21,6 @@ ENHANCEMENT 1  .
       iv_kposn      = ms_komp-kposn
       iv_kschl      = ms_komv_frm-kschl
       iv_icms_rate  = ms_tax_data-icmsrate * ms_tax_data-icmsbase
-                    + mv_additional_rate
       iv_net_amount = ms_tax_data-net_amount
       it_komv       = mt_komv ).
   ENDIF.

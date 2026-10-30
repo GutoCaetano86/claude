@@ -1,7 +1,8 @@
 "! <p class="shorttext synchronized" lang="pt">Reforma Tributária: CBS/IBS na base do ICMS (SD/MM)</p>
-"! Chamada pela enhancement ZENH_BR_ICMS_BC_CBS_IBS no início de
-"! CL_TAX_CALC_BR->CALCULATE_TAXES. Soma o valor de CBS/IBS do item ao valor
-"! líquido do passo de cálculo em curso, conforme o modo de preço do módulo.
+"! Inclui o CBS/IBS do item SOMENTE na base do ICMS (IPI e PIS/COFINS ficam
+"! sem CBS/IBS). Chamada por duas enhancements em CL_TAX_CALC_BR->CALCULATE_TAXES:
+"!   ZENH_BR_ICMS_BC_CBS_IBS      (início) - ADJUST_NET_AMOUNT
+"!   ZENH_BR_ICMS_BC_CBS_IBS_FIM  (fim)    - GET_ICMS_BASE_INCREMENT
 "!
 "! Configuração 100% na STVARV (nada fixo no código), separada por módulo:
 "!   ZBR_ICMS_BC_CBS_IBS_ATIVO     (Parâmetro) = 'X' liga a regra (geral)
@@ -14,20 +15,25 @@
 "!                  fixo, o valor do imposto fica nas BX* (passos 180-182).
 "!   Módulo sem modo válido ou sem lista de condições = regra desligada nele.
 "!
-"! Modos (N = líquido, C = CBS+IBS, t = alíquota efetiva do ICMS):
-"!   L - líquido mantido, preço com ICMS sobe: BC = (N + C) / (1 - t)
-"!   B - preço com ICMS mantido, líquido absorve: BC = N / (1 - t) + C
+"! Cálculo (N = líquido, C = CBS+IBS, t = alíquota ICMS, b = fator de base):
+"!   BC ICMS = base standard + C ; ICMS = t x BC ICMS
+"!   L - líquido mantido: o ICMS sobre C entra no preço (V = N + ICMS)
+"!   B - preço com ICMS mantido: o ICMS sobre C sai do líquido
 "! Passos da CL_TAX_CALC_BR (J_1BTXCOND):
 "!   CALCULATE_TAX       SD: ICMI, forma o preço (NETWR + ICMS), com gross-up
 "!                       MM: BX01, passo único, com gross-up
 "!   CALCULATE_INCL_2ND  SD: IBRX, base já inclui ICMS (sem gross-up)
-"! O ajuste é feito sobre o NET_AMOUNT que o standard preparou para o passo
-"! (no ICMI o KAWRT da linha é a quantidade).
+"! No CALCULATE_TAX em modo L o líquido recebe t x b x C antes do gross-up:
+"! o valor com ICMS sai = N + ICMS final, sem C, e é a base de IPI e PIS/COFINS.
+"! No fim do cálculo o ICMS recebe t x b x C e as bases do ICMS recebem C.
 "!
 "! Valor de CBS/IBS: KWERT da condição. Quando a condição ainda não tem valor
 "! (ex. faturamento com tipo de preço G: impostos redeterminados e CBS/IBS
 "! depois do ICMI no esquema, num cálculo único), usa alíquota x base, com a
 "! base = líquido do item (NET_AMOUNT do passo CALCULATE_TAX).
+"!
+"! Fora do escopo (seguem o standard, sem CBS/IBS): FCP, ICMS-ST, partilha
+"! (DIFAL), Convênio 100, CT-e.
 CLASS zcl_br_icms_base_cbs_ibs DEFINITION
   PUBLIC
   FINAL
@@ -59,13 +65,14 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
                 iv_base          TYPE ty_amount OPTIONAL
       RETURNING VALUE(rv_amount) TYPE ty_amount.
 
-    "! Valor líquido do passo ajustado conforme o modo, uma única vez por passo
+    "! Início do cálculo: NET_AMOUNT do passo ajustado conforme o modo e
+    "! registro do CBS/IBS que o fim do cálculo soma na base do ICMS
     "! @parameter io_calc       | Instância da CL_TAX_CALC_BR (ME)
     "! @parameter iv_kappl      | Aplicação do cálculo (MS_KOMK-KAPPL)
     "! @parameter iv_cond_code  | Código do passo (GET_CONDITION_CODE)
     "! @parameter iv_kposn      | Item (MS_KOMP-KPOSN)
     "! @parameter iv_kschl      | Condição que chamou o cálculo (MS_KOMV_FRM-KSCHL)
-    "! @parameter iv_icms_rate  | Alíquota efetiva do gross-up (fração, ex. 0,17)
+    "! @parameter iv_icms_rate  | Alíquota ICMS x fator de base (fração, ex. 0,12)
     "! @parameter iv_net_amount | NET_AMOUNT preparado pelo standard neste passo
     "! @parameter it_komv       | KOMV do item
     "! @parameter rv_net_amount | NET_AMOUNT ajustado
@@ -79,6 +86,17 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
                 iv_net_amount        TYPE kawrt
                 it_komv              TYPE tax_xkomv_tab
       RETURNING VALUE(rv_net_amount) TYPE kawrt.
+
+    "! Fim do cálculo: CBS/IBS a somar na base do ICMS deste passo (0 = nada)
+    "! @parameter io_calc    | Instância da CL_TAX_CALC_BR (ME)
+    "! @parameter iv_kposn   | Item (MS_KOMP-KPOSN)
+    "! @parameter iv_kschl   | Condição que chamou o cálculo (MS_KOMV_FRM-KSCHL)
+    "! @parameter rv_amount  | CBS + IBS a somar na base do ICMS
+    CLASS-METHODS get_icms_base_increment
+      IMPORTING io_calc          TYPE REF TO object
+                iv_kposn         TYPE kposn
+                iv_kschl         TYPE kscha
+      RETURNING VALUE(rv_amount) TYPE ty_amount.
 
   PRIVATE SECTION.
     CONSTANTS:
@@ -100,12 +118,14 @@ CLASS zcl_br_icms_base_cbs_ibs DEFINITION
              r_kschl TYPE ty_r_kschl,
            END OF ty_cfg.
 
-    " Último valor ajustado por instância / item / passo
+    " Por instância / item / passo: último NET_AMOUNT devolvido e o CBS/IBS
+    " que o fim do cálculo soma na base do ICMS (0 = não soma)
     TYPES: BEGIN OF ty_memo,
-             calc  TYPE REF TO object,
-             kposn TYPE kposn,
-             kschl TYPE kscha,
-             net   TYPE kawrt,
+             calc     TYPE REF TO object,
+             kposn    TYPE kposn,
+             kschl    TYPE kscha,
+             net      TYPE kawrt,
+             icms_add TYPE ty_amount,
            END OF ty_memo.
 
     " Base de CBS/IBS (líquido) guardada no passo CALCULATE_TAX do item
@@ -189,13 +209,16 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
 
 
   METHOD adjust_net_amount.
-    DATA lv_add TYPE ty_amount.
+    DATA:
+      lv_add_net  TYPE ty_amount,
+      lv_icms_add TYPE ty_amount.
 
     rv_net_amount = iv_net_amount.
 
     " CALCULATE_TAXES pode rodar 2x no mesmo passo sem o standard refazer o
     " NET_AMOUNT (ADJUST_ICMS_DUE_MINPRICE, nota 2141500): se o valor recebido
-    " é o que este método devolveu da última vez, o ajuste já está dentro.
+    " é o que este método devolveu da última vez, o ajuste já está dentro e
+    " o registro para o fim do cálculo continua valendo.
     READ TABLE gt_memo ASSIGNING FIELD-SYMBOL(<ls_memo>)
          WITH KEY calc  = io_calc
                   kposn = iv_kposn
@@ -215,33 +238,47 @@ CLASS zcl_br_icms_base_cbs_ibs IMPLEMENTATION.
                                            iv_base  = lv_base ).
 
     IF iv_cond_code = c_code_incl_2nd.
-      " Base já inclui o ICMS (IBRX): soma direta nos dois modos
-      lv_add = lv_cbs_ibs.
+      " IBRX: preço com ICMS já formado; CBS/IBS só na base do ICMS
+      lv_icms_add = lv_cbs_ibs.
 
     ELSEIF get_cfg( iv_kappl )-modo = c_modo_liquid.
-      " Líquido: CBS/IBS entra antes do gross-up, o preço com ICMS sobe
-      lv_add = lv_cbs_ibs.
+      " Líquido: o ICMS sobre o CBS/IBS entra no preço. Somar t x C ao
+      " líquido faz o gross-up sair N + ICMS final, sem o CBS/IBS
+      lv_add_net  = lv_cbs_ibs * iv_icms_rate.
+      lv_icms_add = lv_cbs_ibs.
 
     ELSEIF iv_kappl = c_kappl_sd.
       " Bruto SD: passo de preço (ICMI) fica como no standard; o CBS/IBS
-      " entra só no IBRX, sobre o preço com ICMS já formado
-      lv_add = 0.
+      " entra só no IBRX
+      lv_icms_add = 0.
 
     ELSE.
-      " Bruto MM: passo único com gross-up. Somar C x (1 - t) ao líquido faz
-      " a base sair N / (1 - t) + C, ou seja, preço com ICMS + CBS/IBS
-      lv_add = lv_cbs_ibs * ( 1 - iv_icms_rate ).
+      " Bruto MM: preço com ICMS mantido; CBS/IBS só na base do ICMS
+      lv_icms_add = lv_cbs_ibs.
     ENDIF.
 
-    rv_net_amount = iv_net_amount + lv_add.
+    rv_net_amount = iv_net_amount + lv_add_net.
 
     IF <ls_memo> IS ASSIGNED.
-      <ls_memo>-net = rv_net_amount.
+      <ls_memo>-net      = rv_net_amount.
+      <ls_memo>-icms_add = lv_icms_add.
     ELSE.
-      APPEND VALUE #( calc  = io_calc
-                      kposn = iv_kposn
-                      kschl = iv_kschl
-                      net   = rv_net_amount ) TO gt_memo.
+      APPEND VALUE #( calc     = io_calc
+                      kposn    = iv_kposn
+                      kschl    = iv_kschl
+                      net      = rv_net_amount
+                      icms_add = lv_icms_add ) TO gt_memo.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD get_icms_base_increment.
+    READ TABLE gt_memo ASSIGNING FIELD-SYMBOL(<ls_memo>)
+         WITH KEY calc  = io_calc
+                  kposn = iv_kposn
+                  kschl = iv_kschl.
+    IF sy-subrc = 0.
+      rv_amount = <ls_memo>-icms_add.
     ENDIF.
   ENDMETHOD.
 
